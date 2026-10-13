@@ -167,7 +167,9 @@ these tools before compilation. Keeping this matrix separate lets Linux
 host/provider acceptance run with only the host compiler.
 
 `npm run verify:ghidra:windows` checks source-owned native x86-64 PE applications;
-`-- --x86` selects x86 and `-- --dll` selects DLLs, and the flags can be combined.
+`-- --x86` selects x86, `-- --arm64` selects a handcrafted ARM64 PE fixture, and
+`-- --dll` selects DLLs; architecture and DLL flags can be combined. ARM/ARM64
+real Windows verification and compiler-produced coverage remain pending.
 These lanes check all 25 read-only operations, target/snapshot/import SHA-256 linkage,
 and project, endpoint, process, and runtime cleanup. The independent native
 lane checks DACLs, handle admission, cancellation, and Job Object lifecycle.
