@@ -34,7 +34,10 @@ import {
   spawnOwnedProviderProcess,
 } from "../process/ProviderProcess.js";
 import { ghidraJavaEnvironment } from "./GhidraInstallation.js";
-import { ghidraJavaLaunch } from "./GhidraJavaLaunch.js";
+import {
+  ghidraJavaLaunch,
+  GhidraLaunchSupportError,
+} from "./GhidraJavaLaunch.js";
 import type { GhidraTransportKind } from "./GhidraTransport.js";
 import {
   snapshotGhidraExtensions,
@@ -131,8 +134,13 @@ export class GhidraLaunchError extends Error {
 const ghidraLaunchCommandOutput = (
   cause: unknown,
 ): AnalysisCapturedOutput | undefined => {
-  const failure = execFileOutputFailure(cause);
-  if (failure === undefined) return undefined;
+  const failure =
+    cause instanceof GhidraLaunchSupportError
+      ? cause.outcome
+      : execFileOutputFailure(cause);
+  // Native aborts do not establish completeness; the detailed cause retains it as unknown.
+  if (failure === undefined || failure.outputTruncated === null)
+    return undefined;
   return {
     stdout: failure.stdout,
     stderr: failure.stderr,

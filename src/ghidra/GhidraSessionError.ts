@@ -2,6 +2,7 @@ import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { DarwinProcessOwnershipInspectionError } from "../process/DarwinProcessRunTokenReader.js";
 import { boundedUtf8Text } from "../process/boundedUtf8Text.js";
+import { GhidraLaunchSupportError } from "./GhidraJavaLaunch.js";
 import {
   GhidraLaunchError,
   GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
@@ -11,6 +12,7 @@ const MAX_CAUSE_DEPTH = 3;
 const MAX_CAUSE_MESSAGE_BYTES = 2 * 1024;
 const MAX_CAUSE_FIELD_BYTES = 1024;
 const MAX_COMPILER_STDERR_BYTES = 8 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES = 8 * 1024;
 
 /** Stable failure phase for one private Ghidra headless session. */
 export type GhidraSessionFailureKind =
@@ -152,6 +154,7 @@ const describeErrorCause = (
     ...(message.truncated ? { message_truncated: true } : {}),
     ...causeCode(cause, redact),
     ...causeSignal(cause, redact),
+    ...causeCommandOutcome(cause, redact),
     ...causeCompilerOutcome(cause, redact),
     ...causeLaunchOutcome(cause, redact),
     ...nestedErrorCause(cause, redact, depth),
@@ -188,6 +191,35 @@ const causeSignal = (
   }
   if (signal === null) return { signal: null };
   return {};
+};
+
+const causeCommandOutcome = (
+  cause: Error,
+  redact: (value: string) => string,
+): Record<string, JsonValue> => {
+  if (!(cause instanceof GhidraLaunchSupportError)) return {};
+  const outcome = cause.outcome;
+  if (outcome === undefined) return {};
+  const stdout = boundedUtf8Text(
+    redact(outcome.stdout),
+    MAX_COMMAND_OUTPUT_BYTES,
+  );
+  const stderr = boundedUtf8Text(
+    redact(outcome.stderr),
+    MAX_COMMAND_OUTPUT_BYTES,
+  );
+  return {
+    command_outcome: {
+      stdout: stdout.text,
+      stderr: stderr.text,
+      stdoutBytes: Buffer.byteLength(outcome.stdout, "utf8"),
+      stderrBytes: Buffer.byteLength(outcome.stderr, "utf8"),
+      stdoutTruncated: stdout.truncated,
+      stderrTruncated: stderr.truncated,
+      outputTruncated: outcome.outputTruncated,
+      killed: outcome.killed,
+    },
+  };
 };
 
 const causeCompilerOutcome = (
