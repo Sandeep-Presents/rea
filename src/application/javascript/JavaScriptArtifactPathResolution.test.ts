@@ -1318,6 +1318,29 @@ describe("package import alias resolution", () => {
     });
   });
 
+  it("keeps package import aliases available for runtime entrypoints", () => {
+    const files = aliasFiles({
+      "package.json": JSON.stringify({
+        imports: { "#worker": "./worker.js" },
+      }),
+      "main.cjs": "",
+      "worker.js": "",
+    });
+    expect(
+      resolve({
+        declaredPath: "#worker",
+        sourcePath: "main.cjs",
+        context: "module-specifier",
+        files,
+        runtimeEntrypoint: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "resolved",
+      resolved_path: "worker.js",
+      declared_path: "#worker",
+    });
+  });
+
   it("uses a nested package imports map rather than the application root", () => {
     const files = aliasFiles({
       "package.json": JSON.stringify({
@@ -2327,3 +2350,141 @@ describe("exact HTML resource resolution", () => {
     });
   });
 });
+
+describe("exact Electron runtime entrypoint resolution", () => {
+  it("accepts an exact extensionless Electron URL resource", () => {
+    const files = fileMap([
+      file("app/main.cjs", "root"),
+      file("app/renderer", "root"),
+      file("app/renderer.js", "root"),
+    ]);
+    expect(
+      resolve({
+        declaredPath: "./renderer",
+        sourcePath: "app/main.cjs",
+        context: "module-specifier",
+        files,
+        exactUrlResource: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "resolved",
+      resolved_path: "app/renderer",
+    });
+  });
+
+  it("checks local paths exactly while preserving bare package lookup", () => {
+    const files = fileMap([
+      file("app/main.cjs", "root"),
+      file("app/worker.js", "root"),
+      file("app/worker", "root"),
+      file("app/worker#v1.js", "root"),
+      file(
+        "node_modules/exported/package.json",
+        "root",
+        '{"exports":{"./parser":"./parser.cjs"}}',
+      ),
+      file("node_modules/exported/parser.cjs", "root"),
+      file("app/fallback/index.js", "root"),
+    ]);
+    expect(
+      resolve({
+        declaredPath: "./worker.js",
+        sourcePath: "app/main.cjs",
+        context: "module-specifier",
+        files,
+        runtimeEntrypoint: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "resolved",
+      resolved_path: "app/worker.js",
+    });
+    expect(
+      resolve({
+        declaredPath: "exported/parser",
+        sourcePath: "app/main.cjs",
+        context: "module-specifier",
+        files,
+        runtimeEntrypoint: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "resolved",
+      resolved_path: "node_modules/exported/parser.cjs",
+    });
+    expect(
+      resolve({
+        declaredPath: "./worker#v1.js",
+        sourcePath: "app/main.cjs",
+        context: "module-specifier",
+        files,
+        runtimeEntrypoint: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "resolved",
+      resolved_path: "app/worker#v1.js",
+    });
+    expect(
+      resolve({
+        declaredPath: "./fallback",
+        sourcePath: "app/main.cjs",
+        context: "module-specifier",
+        files,
+        runtimeEntrypoint: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "not-found",
+      resolved_path: null,
+    });
+  });
+
+  it("accepts an exact extensionless file but not a directory index", () => {
+    const files = fileMap([
+      file("app/main.cjs", "root"),
+      file("app/preload", "root"),
+      file("app/preload.js", "root"),
+      file("app/fallback/index.js", "root"),
+    ]);
+    expect(
+      resolve({
+        declaredPath: "./preload",
+        sourcePath: "app/main.cjs",
+        context: "module-specifier",
+        files,
+        runtimeEntrypoint: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "resolved",
+      resolved_path: "app/preload",
+    });
+    expect(
+      resolve({
+        declaredPath: "./fallback",
+        sourcePath: "app/main.cjs",
+        context: "module-specifier",
+        files,
+        runtimeEntrypoint: true,
+      }),
+    ).toMatchObject({
+      resolution_status: "not-found",
+      resolved_path: null,
+    });
+  });
+});
+
+it.each(["#home", "?theme=dark", ""])(
+  "does not invent a document base for runtime URL %s",
+  (declaredPath) => {
+    expect(
+      resolve({
+        declaredPath,
+        sourcePath: "main.cjs",
+        context: "url-reference",
+        exactUrlResource: true,
+        files: fileMap([file("main.cjs", "root")]),
+      }),
+    ).toMatchObject({
+      declared_path: declaredPath,
+      resolution_status: "unavailable",
+      resolved_path: null,
+    });
+  },
+);
