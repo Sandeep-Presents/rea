@@ -139,13 +139,27 @@ The result preserves the requested names in `selection.type_names` and reports
 unmatched names separately. If metadata names are unreadable, limitations retain
 that uncertainty. With no selection, `selection` is null and whole-assembly
 inspection keeps its existing resource policy. Selection restricts types,
-fields, methods, call edges and field accesses; member references remain an
-assembly-wide inventory, so output size is not guaranteed to be small.
+fields, methods, call edges, field accesses and user strings; member references
+remain an assembly-wide inventory, so output size is not guaranteed to be small.
 
 Coverage describes the selected members. Comparisons leave members outside the
 opposite observation's selection unknown, and application graphs report their
 selected scope as partial. Neither makes an absence claim about the whole
 assembly. Older member Evidence without `selection` remains readable.
+
+### User strings
+
+`ldstr` anchors keep their build-local `0x70` tokens. `user_strings` lists each
+distinct token loaded by an inspected method body once, in token order, with
+its `#US` file offset and decoded value. Values keep their stored UTF-16 code
+units, including unpaired surrogates. The terminal flag is checked against
+ECMA-335 II.24.2.4. A differing flag is reported with its byte offset as partial
+metadata coverage while preserving the readable literal. Toolchain conventions
+can differ; this conformance observation does not establish runtime rejection.
+A missing `#US` stream is one stream-level issue; a malformed item is reported
+against its token. Either makes coverage partial, and readable literals remain.
+Normalized CIL digests do not include decoded values. Older member Evidence
+without `user_strings` reads as `null`: not examined.
 
 ## Analysis objective
 
