@@ -10,12 +10,37 @@ import {
   semanticStaticPropertyKey,
   unwrapJavaScriptExpression,
 } from "./javascriptAstValues.js";
+import { semanticPropertyPathKeyMatches } from "./javascriptSemanticPropertyPaths.js";
 import { stringValue } from "./javascriptStaticAnalysisHelpers.js";
+import { semanticTopLevelEffectFollowsCapture } from "./javascriptSemanticMutationInitializers.js";
 
 interface JavaScriptRequireOrigin {
   readonly origin: JavaScriptModuleOrigin;
   readonly call: t.CallExpression;
 }
+
+/** Node's unbound process reference shares the cached process exports object. */
+export const semanticGlobalProcessOrigin = (
+  node: t.Node,
+  state: JavaScriptSemanticAnalysisState,
+): JavaScriptModuleOrigin | undefined =>
+  t.isIdentifier(node, { name: "process" }) &&
+  resolveSemanticBindingState(state, node, "process") === undefined &&
+  !semanticResolutionBlocked(state, node, "process") &&
+  !state.ambientWriteEffects.some(
+    ({ path, node: write }) =>
+      path.length <= 2 &&
+      path.every((key, index) =>
+        semanticPropertyPathKeyMatches(key, ["global", "process"][index]!),
+      ) &&
+      !semanticTopLevelEffectFollowsCapture(node, write, state.parentsByNode),
+  ) &&
+  !(state.ambientBindingWrites.get("process") ?? []).some(
+    (write) =>
+      !semanticTopLevelEffectFollowsCapture(node, write, state.parentsByNode),
+  )
+    ? { specifier: "node:process", importedPath: [], resolutionMode: "require" }
+    : undefined;
 
 /** Recover an unshadowed literal require origin and its exact member path. */
 export const semanticRequireOrigin = (
@@ -47,7 +72,15 @@ export const semanticRequireOrigin = (
   if (
     resolveSemanticBindingState(state, current.callee, "require") !==
       undefined ||
-    semanticResolutionBlocked(state, current.callee, "require")
+    semanticResolutionBlocked(state, current.callee, "require") ||
+    (state.ambientBindingWrites.get("require") ?? []).some(
+      (write) =>
+        !semanticTopLevelEffectFollowsCapture(
+          current,
+          write,
+          state.parentsByNode,
+        ),
+    )
   )
     return undefined;
   const specifier = stringValue(current.arguments[0]);
@@ -61,4 +94,40 @@ export const semanticRequireOrigin = (
         },
         call: current,
       };
+};
+
+/** Node's fs.promises export and fs/promises require share one object. */
+export const semanticRequireExportsIdentity = <Key>(
+  specifier: string,
+  path: readonly Key[],
+): { readonly specifier: string; readonly path: readonly (Key | string)[] } => {
+  const name = specifier.replace(/^node:/u, "");
+  return name === "fs/promises"
+    ? { specifier: "fs", path: ["promises", ...path] }
+    : { specifier: name, path };
+};
+
+const MUTABLE_BUILTIN_DEFAULTS = new Set([
+  "fs",
+  "fs/promises",
+  "net",
+  "http",
+  "https",
+  "child_process",
+  "timers",
+  "process",
+]);
+
+/** Mutable default objects share CommonJS identity; namespace/function imports do not. */
+export const semanticMutableBuiltinOrigin = (
+  origin: JavaScriptModuleOrigin,
+): JavaScriptModuleOrigin | undefined => {
+  if (origin.resolutionMode === "require") return origin;
+  const specifier = origin.specifier.replace(/^node:/u, "");
+  if (!MUTABLE_BUILTIN_DEFAULTS.has(specifier)) return undefined;
+  if (origin.importedPath[0] === "default")
+    return { ...origin, importedPath: origin.importedPath.slice(1) };
+  return specifier === "fs" && origin.importedPath[0] === "promises"
+    ? origin
+    : undefined;
 };
