@@ -517,11 +517,11 @@ const removeManagedSkills = async (
   environment: Readonly<NodeJS.ProcessEnv>,
   platform: NodeJS.Platform,
 ): Promise<UninstallItem> => {
-  // Every destination shares one summary item, so each result is labeled by
-  // the directory it refers to.
+  // Every destination shares one summary item; preserve both client and path.
   const results = await Promise.all(
-    skillDestinations(home, undefined, environment, platform).map(({ path }) =>
-      removeManagedSkill(path, path, fileSystem),
+    skillDestinations(home, undefined, environment, platform).map(
+      ({ client, path }) =>
+        removeManagedSkill(path, `${client} (${path})`, fileSystem),
     ),
   );
   const failed = results.find(({ status }) => status === "failed");
