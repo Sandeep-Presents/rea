@@ -85,6 +85,34 @@ export function* collectJavaScriptIdentityWritesSteps(
   const keyedMutators = new Set(["set", "deleteProperty", "defineProperty"]);
   yield* traverseJavaScriptAstSteps(program, {
     enter: (node) => {
+      const target = t.isAssignmentExpression(node)
+        ? node.left
+        : t.isUpdateExpression(node)
+          ? node.argument
+          : t.isUnaryExpression(node, { operator: "delete" })
+            ? node.argument
+            : t.isForOfStatement(node) || t.isForInStatement(node)
+              ? node.left
+              : undefined;
+      if (target === undefined) return;
+      for (const leaf of semanticWriteTargets(target)) {
+        if (t.isIdentifier(leaf)) {
+          for (const identity of origin(leaf, "binding"))
+            retain(node, identity);
+          continue;
+        }
+        const member = unwrapJavaScriptExpression(leaf).node;
+        if (
+          !t.isMemberExpression(member) &&
+          !t.isOptionalMemberExpression(member)
+        )
+          continue;
+        const key = semanticStaticPropertyKey(member.property, member.computed);
+        for (const identity of origin(member.object, "member"))
+          retain(node, [...identity, key]);
+      }
+    },
+    exit: (node) => {
       if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
         const invocation = intrinsicInvocation(node);
         if (invocation?.kind === "opaque") {
@@ -135,32 +163,6 @@ export function* collectJavaScriptIdentityWritesSteps(
             }
           }
         }
-      }
-      const target = t.isAssignmentExpression(node)
-        ? node.left
-        : t.isUpdateExpression(node)
-          ? node.argument
-          : t.isUnaryExpression(node, { operator: "delete" })
-            ? node.argument
-            : t.isForOfStatement(node) || t.isForInStatement(node)
-              ? node.left
-              : undefined;
-      if (target === undefined) return;
-      for (const leaf of semanticWriteTargets(target)) {
-        if (t.isIdentifier(leaf)) {
-          for (const identity of origin(leaf, "binding"))
-            retain(node, identity);
-          continue;
-        }
-        const member = unwrapJavaScriptExpression(leaf).node;
-        if (
-          !t.isMemberExpression(member) &&
-          !t.isOptionalMemberExpression(member)
-        )
-          continue;
-        const key = semanticStaticPropertyKey(member.property, member.computed);
-        for (const identity of origin(member.object, "member"))
-          retain(node, [...identity, key]);
       }
     },
   });
