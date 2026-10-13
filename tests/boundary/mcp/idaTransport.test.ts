@@ -1,6 +1,11 @@
 import { createServer } from "node:http";
+import { ProtocolError } from "@modelcontextprotocol/client";
 import { afterEach, expect, it } from "vitest";
 import { z } from "zod";
+import { AnalysisProtocolError } from "../../../src/domain/analysisErrorCore.js";
+import type { JsonValue } from "../../../src/domain/jsonValue.js";
+import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import { ProviderAdapterError } from "../../../src/domain/providerAdapterError.js";
 import { createIdaMcpConnection } from "../../../src/ida/IdaMcpConnection.js";
 import type { IdaMcpConnection } from "../../../src/ida/IdaMcpConnection.js";
 
@@ -19,7 +24,31 @@ const requestSchema = z.object({
     .passthrough()
     .optional(),
 });
-const fixture = async (redirectUrl?: string, cycle = false, native = false) => {
+type IdaTransportFixtureOptions = {
+  readonly redirectUrl?: string;
+  readonly cycle?: boolean;
+  readonly native?: boolean;
+  readonly toolResult?: JsonValue;
+  readonly toolRpcError?: {
+    readonly code: number;
+    readonly message: string;
+  };
+  readonly toolStatus?: number;
+  readonly toolContentType?: string;
+  readonly toolResponseBody?: string;
+  readonly configurationHeaders?: Readonly<Record<string, string>>;
+};
+const fixture = async ({
+  redirectUrl,
+  cycle = false,
+  native = false,
+  toolResult,
+  toolRpcError,
+  toolStatus = 200,
+  toolContentType = "application/json",
+  toolResponseBody,
+  configurationHeaders = { Authorization: "Bearer transport-fixture-secret" },
+}: IdaTransportFixtureOptions = {}) => {
   const methods: string[] = [];
   const headers: (string | undefined)[] = [];
   const server = createServer(async (request, response) => {
@@ -87,19 +116,34 @@ const fixture = async (redirectUrl?: string, cycle = false, native = false) => {
                   },
                 ],
               }
-            : native
-              ? {
-                  content: [
-                    {
-                      type: "text",
-                      text: JSON.stringify([{ observed: true }]),
-                    },
-                  ],
-                  structuredContent: { result: [], _output_truncated: true },
-                }
-              : { content: [], structuredContent: { observed: true } };
-    response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ jsonrpc: "2.0", id: input.id, result }));
+            : toolResult !== undefined
+              ? toolResult
+              : native
+                ? {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify([{ observed: true }]),
+                      },
+                    ],
+                    structuredContent: { result: [], _output_truncated: true },
+                  }
+                : { content: [], structuredContent: { observed: true } };
+    response.writeHead(input.method === "tools/call" ? toolStatus : 200, {
+      "Content-Type":
+        input.method === "tools/call" ? toolContentType : "application/json",
+    });
+    response.end(
+      input.method === "tools/call" && toolResponseBody !== undefined
+        ? toolResponseBody
+        : JSON.stringify({
+            jsonrpc: "2.0",
+            id: input.id,
+            ...(input.method === "tools/call" && toolRpcError !== undefined
+              ? { error: toolRpcError }
+              : { result }),
+          }),
+    );
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   cleanups.push(
@@ -117,7 +161,7 @@ const fixture = async (redirectUrl?: string, cycle = false, native = false) => {
   const connection: IdaMcpConnection = createIdaMcpConnection(
     {
       url: `http://127.0.0.1:${address.port}/mcp`,
-      headers: { Authorization: "Bearer transport-fixture-secret" },
+      headers: configurationHeaders,
       mode: native ? "attached" : "headless",
       ...(native ? { protocol: "native" as const } : {}),
       timeoutMs: 2000,
@@ -150,13 +194,13 @@ it("uses the pinned SDK for a local Streamable HTTP handshake, paged discovery, 
 
 it("rejects redirects instead of forwarding transport credentials to another endpoint", async () => {
   const destination = await fixture();
-  const { connection } = await fixture(destination.url);
+  const { connection } = await fixture({ redirectUrl: destination.url });
   await expect(connection.connect()).rejects.toThrow();
   expect(destination.headers).toEqual([]);
 });
 
 it("rejects nonterminating SDK pagination instead of returning a partial tool catalog", async () => {
-  const { connection, methods } = await fixture(undefined, true);
+  const { connection, methods } = await fixture({ cycle: true });
   await expect(connection.connect()).rejects.toThrow(
     "pagination did not terminate",
   );
@@ -166,7 +210,7 @@ it("rejects nonterminating SDK pagination instead of returning a partial tool ca
 });
 
 it("reads native metadata resources and complete JSON text through the real SDK transport", async () => {
-  const { connection, methods } = await fixture(undefined, false, true);
+  const { connection, methods } = await fixture({ native: true });
   expect(await connection.connect()).toEqual(["first", "second"]);
   expect(await connection.call("first", {})).toEqual([{ observed: true }]);
   expect(await connection.readResource?.("ida://idb/metadata")).toMatchObject({
@@ -175,4 +219,527 @@ it("reads native metadata resources and complete JSON text through the real SDK 
   });
   await expect(connection.readResource?.("ida://other")).rejects.toThrow();
   expect(methods).toContain("resources/read");
+});
+
+it.each([false, true])(
+  "preserves an upstream tool rejection through SDK transport and public error projection (native: %s)",
+  async (native) => {
+    const reason =
+      "Invalid params: unexpected parameters: ['offset', 'max_lines']";
+    const { connection } = await fixture({
+      native,
+      toolResult: {
+        isError: true,
+        content: [{ type: "text", text: reason }],
+      },
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {
+        addr: "0x1000",
+        offset: 0,
+        max_lines: 100,
+      })
+      .catch((cause: unknown) => cause);
+
+    expect(failure).toBeInstanceOf(AnalysisProtocolError);
+    if (!(failure instanceof AnalysisProtocolError))
+      throw new Error(
+        "Expected the upstream rejection to remain a protocol error",
+      );
+    expect(projectAnalysisError(failure)).toMatchObject({
+      code: "unreadable_output",
+      details: { diagnostics: { reason } },
+    });
+  },
+);
+
+it.each([false, true])(
+  "redacts configured credentials from SDK tool errors while retaining caller context (native: %s)",
+  async (native) => {
+    const configurationHeaders = {
+      aUtHoRiZaTiOn: "\r\n \tBearer transport-fixture-secret \r\n",
+      "Proxy-Authorization": "Basic proxy-fixture-secret",
+      CoOkIe: "session=cookie-fixture-secret",
+      "X-Evidence": "selected-header-evidence",
+    };
+    const context =
+      "/caller/input?cursor=visible API_KEY=caller-evidence selected-header-evidence";
+    const { connection } = await fixture({
+      native,
+      configurationHeaders,
+      toolResult: {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text:
+              "Rejected Bearer transport-fixture-secret / transport-fixture-secret / Basic proxy-fixture-secret / proxy-fixture-secret / session=cookie-fixture-secret at " +
+              context,
+          },
+        ],
+      },
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {})
+      .catch((cause: unknown) => cause);
+    if (!(failure instanceof AnalysisProtocolError))
+      throw new Error(
+        "Expected the upstream rejection to remain a protocol error",
+      );
+    const reason =
+      "Rejected [redacted transport credential] / [redacted transport credential] / [redacted transport credential] / [redacted transport credential] / [redacted transport credential] at " +
+      context;
+    expect(failure.message).toBe("IDA MCP tool failed: " + reason);
+    expect(projectAnalysisError(failure)).toMatchObject({
+      code: "unreadable_output",
+      details: { diagnostics: { reason } },
+    });
+  },
+);
+
+const parsedCredentialCases: readonly {
+  label: string;
+  headers: Readonly<Record<string, string>>;
+  payloads: readonly string[];
+}[] = [
+  {
+    label: "Cookie values",
+    headers: {
+      Cookie:
+        'session=cookie-fixture-secret; quoted="quoted-fixture=value=="; empty=',
+    },
+    payloads: ["cookie-fixture-secret", "quoted-fixture=value=="],
+  },
+  {
+    label: "Authorization Token payload",
+    headers: { Authorization: "Token custom-fixture-token+/==" },
+    payloads: ["custom-fixture-token+/=="],
+  },
+  {
+    label: "Proxy-Authorization custom token68",
+    headers: { "Proxy-Authorization": "Custom proxy-fixture-token._~+/-==" },
+    payloads: ["proxy-fixture-token._~+/-=="],
+  },
+  {
+    label: "Digest auth-param values",
+    headers: {
+      Authorization:
+        'Digest username="fixture-user", nonce="nonce,fixture", response="response\\\"secret", opaque="back\\\\slash"',
+    },
+    payloads: [
+      "fixture-user",
+      "nonce,fixture",
+      'response"secret',
+      "back\\slash",
+    ],
+  },
+];
+
+it.each(
+  parsedCredentialCases.flatMap((testCase) =>
+    [false, true].map((native) => ({ ...testCase, native })),
+  ),
+)(
+  "redacts parsed $label from tool errors (native: $native)",
+  async ({ headers, payloads, native }) => {
+    const context = "/caller/input?cursor=visible API_KEY=caller-evidence";
+    const { connection } = await fixture({
+      native,
+      configurationHeaders: headers,
+      toolResult: {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: "Rejected " + payloads.join(" / ") + " at " + context,
+          },
+        ],
+      },
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {})
+      .catch((cause: unknown) => cause);
+    if (!(failure instanceof AnalysisProtocolError))
+      throw new Error(
+        "Expected the upstream rejection to remain a protocol error",
+      );
+    const reason =
+      "Rejected " +
+      payloads.map(() => "[redacted transport credential]").join(" / ") +
+      " at " +
+      context;
+    expect(failure.message).toBe("IDA MCP tool failed: " + reason);
+    expect(projectAnalysisError(failure)).toMatchObject({
+      code: "unreadable_output",
+      details: { diagnostics: { reason } },
+    });
+  },
+);
+
+it.each([false, true])(
+  "retains successful credential-like evidence through SDK transport (native: %s)",
+  async (native) => {
+    const evidence = {
+      observed: "custom-fixture-token+/==",
+      cookie: "quoted-fixture=value==",
+      digest: 'response"secret',
+    };
+    const { connection } = await fixture({
+      native,
+      configurationHeaders: {
+        Authorization: "Token custom-fixture-token+/==",
+        Cookie: 'session="quoted-fixture=value=="',
+        "Proxy-Authorization": 'Digest response="response\\\"secret"',
+      },
+      toolResult: native
+        ? { content: [{ type: "text", text: JSON.stringify(evidence) }] }
+        : { content: [], structuredContent: evidence },
+    });
+    await connection.connect();
+    expect(await connection.call("first", {})).toEqual(evidence);
+  },
+);
+
+it.each<{
+  label: string;
+  headers: Readonly<Record<string, string>>;
+  payloads: readonly string[];
+}>([
+  {
+    label: "Cookie and custom token payloads",
+    headers: {
+      Authorization: "Token custom-fixture-token",
+      Cookie: "session=cookie-fixture-secret",
+    },
+    payloads: ["custom-fixture-token", "cookie-fixture-secret"],
+  },
+  {
+    label: "JSON-escaped Digest payloads and header",
+    headers: {
+      Authorization: 'Digest response="q\\\"uote", opaque="back\\\\slash"',
+    },
+    payloads: [
+      'q"uote',
+      "back\\slash",
+      'Digest response="q\\\"uote", opaque="back\\\\slash"',
+    ],
+  },
+])(
+  "redacts $label echoed in an HTTP failure through the SDK rejection path",
+  async ({ headers, payloads }) => {
+    const context = "/caller/input?cursor=visible API_KEY=caller-evidence";
+    const { connection } = await fixture({
+      toolStatus: 500,
+      configurationHeaders: headers,
+      toolResult: {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text:
+              "Transport rejected " + payloads.join(" / ") + " at " + context,
+          },
+        ],
+      },
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {})
+      .catch((cause: unknown) => cause);
+    expect(failure).not.toBeInstanceOf(AnalysisProtocolError);
+    if (!(failure instanceof Error))
+      throw new Error("Expected the SDK to reject the HTTP failure");
+    expect(failure.message).toContain(
+      "Transport rejected " +
+        payloads.map(() => "[redacted transport credential]").join(" / ") +
+        " at " +
+        context,
+    );
+    for (const payload of payloads)
+      expect(failure.message).not.toContain(
+        JSON.stringify(payload).slice(1, -1),
+      );
+  },
+);
+
+it.each<{
+  label: string;
+  headers: Readonly<Record<string, string>>;
+  credential: string;
+  wire: string;
+  toolContentType: string;
+}>([
+  {
+    label: "Go-style HTML escapes",
+    toolContentType: "application/problem+json; charset=utf-8",
+    headers: { Cookie: "session=<secret>&/fixture" },
+    credential: "<secret>&/fixture",
+    wire: String.raw`\u003csecret\u003e\u0026/fixture`,
+  },
+  {
+    label: "fully escaped ASCII with mixed hex case and solidus",
+    toolContentType: "application/json",
+    headers: { Authorization: "Token aBz/secret" },
+    credential: "aBz/secret",
+    wire: String.raw`\u0061\u0042\u007A\/\u0073\u0065\u0063\u0072\u0065\u0074`,
+  },
+  {
+    label: "Latin-1 auth-param Unicode and solidus escapes",
+    toolContentType: "application/json",
+    headers: { Authorization: 'Digest response="café/secret"' },
+    credential: "café/secret",
+    wire: String.raw`caf\u00E9\/secret`,
+  },
+])(
+  "redacts $label in SDK HTTP failures without rewriting unrelated wire evidence",
+  async ({ headers, credential, wire, toolContentType }) => {
+    const prefix = '{\n  "reason": "Rejected ';
+    const suffix =
+      String.raw`", "numeric": 9007199254740993, "duplicate": "first", "duplicate": "second", "context": "\u003cpublic\u003e\/asset", "symbol": "\ud83d\uDE00"` +
+      "\n}\n";
+    const toolResponseBody = prefix + wire + suffix;
+    expect(JSON.parse(toolResponseBody)).toMatchObject({
+      reason: "Rejected " + credential,
+    });
+    const { connection } = await fixture({
+      toolStatus: 500,
+      toolContentType,
+      configurationHeaders: headers,
+      toolResponseBody,
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {})
+      .catch((cause: unknown) => cause);
+    expect(failure).not.toBeInstanceOf(AnalysisProtocolError);
+    if (!(failure instanceof Error))
+      throw new Error("Expected the SDK to reject the HTTP failure");
+    expect(failure.message).toContain(
+      prefix + "[redacted transport credential]" + suffix,
+    );
+    expect(failure.message).not.toContain(wire);
+  },
+);
+
+const jsonFailureResponses = [
+  { toolStatus: 200, toolContentType: "application/json" },
+  { toolStatus: 500, toolContentType: "application/json" },
+  {
+    toolStatus: 500,
+    toolContentType: "application/problem+json; charset=utf-8",
+  },
+] as const;
+
+it.each(
+  jsonFailureResponses.flatMap((response) =>
+    [
+      {
+        label: "unquoted escaped body",
+        credential: "<token>",
+        wire: String.raw`\u003ctoken\u003e`,
+        toolResponseBody: String.raw`\u003ctoken\u003e`,
+        safeBody: "[redacted transport credential]",
+      },
+      {
+        label: "quoted escaped array entry before invalid JSON",
+        credential: "<s>",
+        wire: String.raw`\u003cs\u003e`,
+        toolResponseBody: String.raw`["\u003cs\u003e",x]`,
+        safeBody: '["[redacted transport credential]",x]',
+      },
+    ].map((body) => ({ ...response, ...body })),
+  ),
+)(
+  "redacts $label from malformed HTTP $toolStatus $toolContentType responses",
+  async ({
+    credential,
+    wire,
+    toolResponseBody,
+    safeBody,
+    toolStatus,
+    toolContentType,
+  }) => {
+    const { connection } = await fixture({
+      configurationHeaders: { Cookie: "token=" + credential },
+      toolResponseBody,
+      toolStatus,
+      toolContentType,
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {})
+      .catch((cause: unknown) => cause);
+    expect(failure).not.toBeInstanceOf(AnalysisProtocolError);
+    if (!(failure instanceof Error))
+      throw new Error("Expected the SDK to reject malformed JSON");
+    expect(failure.message).toContain(safeBody);
+    if (toolStatus === 200)
+      expect(failure.message).toMatch(/malformed.*HTTP.*JSON/iu);
+    else expect(failure.cause).toMatchObject({ data: { status: 500 } });
+    expect(failure.message).not.toContain(toolResponseBody);
+    expect(failure.message).not.toContain(wire);
+    expect(failure.message).not.toContain(credential);
+  },
+);
+
+it.each(
+  jsonFailureResponses.flatMap((response) =>
+    [
+      {
+        credentialLabel: "literal short escape",
+        credential: String.raw`folder\tmp`,
+      },
+      {
+        credentialLabel: "literal Unicode escape",
+        credential: String.raw`folder\u0061`,
+      },
+    ].flatMap((credentialCase) =>
+      [
+        {
+          bodyLabel: "unquoted body",
+          prefix: "Rejected ",
+          suffix: " at /caller/input?cursor=visible",
+        },
+        {
+          bodyLabel: "quoted value in an invalid document",
+          prefix: 'Rejected "',
+          suffix: '" at /caller/input?cursor=visible',
+        },
+        {
+          bodyLabel: "unfinished JSON string",
+          prefix: '{"reason":"Rejected ',
+          suffix: " at /caller/input?cursor=visible",
+        },
+      ].map((body) => ({ ...response, ...credentialCase, ...body })),
+    ),
+  ),
+)(
+  "redacts $credentialLabel in $bodyLabel from HTTP $toolStatus $toolContentType diagnostics and their public projection",
+  async ({ credential, toolStatus, toolContentType, prefix, suffix }) => {
+    const { connection } = await fixture({
+      configurationHeaders: { Authorization: "Custom " + credential },
+      toolStatus,
+      toolContentType,
+      toolResponseBody: prefix + credential + suffix,
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {})
+      .catch((cause: unknown) => cause);
+    if (!(failure instanceof Error))
+      throw new Error("Expected the SDK to reject malformed JSON");
+    expect(failure.message).toContain(
+      prefix + "[redacted transport credential]" + suffix,
+    );
+    expect(failure.message).not.toContain(credential);
+    if (toolStatus === 200)
+      expect(failure.message).toMatch(/malformed.*HTTP.*JSON/iu);
+    else expect(failure.cause).toMatchObject({ data: { status: 500 } });
+    const projected = projectAnalysisError(
+      new ProviderAdapterError("ida", "decompile", {
+        cause: failure,
+        diagnostics: { reason: failure.message },
+      }),
+    );
+    expect(projected).toMatchObject({
+      code: "execution_failure",
+      details: { diagnostics: { reason: failure.message } },
+    });
+    expect(JSON.stringify(projected)).not.toContain(
+      JSON.stringify(credential).slice(1, -1),
+    );
+  },
+);
+
+it("preserves JSON escape syntax that spells a configured credential without containing its value", async () => {
+  const toolResponseBody = String.raw`{"reason":"\u003cpublic\u003e","numeric":9007199254740993}`;
+  const { connection } = await fixture({
+    toolStatus: 500,
+    configurationHeaders: { Cookie: "token=u003c" },
+    toolResponseBody,
+  });
+  await connection.connect();
+  const failure = await connection
+    .call("first", {})
+    .catch((cause: unknown) => cause);
+  expect(failure).not.toBeInstanceOf(AnalysisProtocolError);
+  if (!(failure instanceof Error))
+    throw new Error("Expected the SDK to reject the HTTP failure");
+  expect(failure.message).toContain(toolResponseBody);
+  expect(failure.message).not.toContain("[redacted transport credential]");
+});
+
+it("redacts complete opaque authentication values containing quotes from plain HTTP error bodies", async () => {
+  const credential = 'prefix"quoted"suffix';
+  const header = "Custom " + credential;
+  const context = "/caller/input?cursor=visible API_KEY=caller-evidence";
+  const { connection } = await fixture({
+    toolStatus: 500,
+    toolContentType: "text/plain",
+    configurationHeaders: { Authorization: header },
+    toolResponseBody:
+      "Rejected " + header + " / " + credential + " at " + context,
+  });
+  await connection.connect();
+  const failure = await connection
+    .call("first", {})
+    .catch((cause: unknown) => cause);
+  expect(failure).not.toBeInstanceOf(AnalysisProtocolError);
+  if (!(failure instanceof Error))
+    throw new Error("Expected the SDK to reject the HTTP failure");
+  expect(failure.message).toContain(
+    "Rejected [redacted transport credential] / [redacted transport credential] at " +
+      context,
+  );
+  expect(failure.message).not.toContain(credential);
+});
+
+it.each(["Rejected ", ""])(
+  "redacts quoted literal credentials from text/plain HTTP failures with prefix %j",
+  async (prefix) => {
+    const credential = String.raw`folder\tmp`;
+    const { connection } = await fixture({
+      toolStatus: 500,
+      toolContentType: "text/plain",
+      configurationHeaders: { Authorization: "Custom " + credential },
+      toolResponseBody: prefix + '"' + credential + '"',
+    });
+    await connection.connect();
+    const failure = await connection
+      .call("first", {})
+      .catch((cause: unknown) => cause);
+    expect(failure).not.toBeInstanceOf(AnalysisProtocolError);
+    if (!(failure instanceof Error))
+      throw new Error("Expected the SDK to reject the HTTP failure");
+    expect(failure.message).toContain(
+      prefix + '"[redacted transport credential]"',
+    );
+    expect(failure.message).not.toContain(credential);
+  },
+);
+
+it("redacts a JSON-RPC error exactly once after successful HTTP delivery", async () => {
+  const { connection } = await fixture({
+    configurationHeaders: { Cookie: "token=redacted" },
+    toolRpcError: { code: -32602, message: "redacted at /caller/input" },
+  });
+  await connection.connect();
+  const failure = await connection
+    .call("first", {})
+    .catch((cause: unknown) => cause);
+  if (!(failure instanceof Error))
+    throw new Error("Expected the SDK to reject the JSON-RPC error");
+  expect(failure.cause).toBeInstanceOf(ProtocolError);
+  expect(
+    failure.message.endsWith(
+      "[redacted transport credential] at /caller/input",
+    ),
+  ).toBe(true);
+  expect(
+    failure.message.match(/\[redacted transport credential\]/gu),
+  ).toHaveLength(1);
+  expect(failure.message).not.toContain("[[redacted");
 });
