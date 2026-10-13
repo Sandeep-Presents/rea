@@ -1,8 +1,9 @@
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import {
-  parse as parseYaml,
+  isScalar,
   parseDocument as parseYamlDocument,
   stringify as stringifyYaml,
+  type Document as YamlDocument,
 } from "yaml";
 import { isDeepStrictEqual } from "node:util";
 
@@ -102,6 +103,23 @@ export const clientConfigurationServersKey = (
 const isEmptyClientConfigurationText = (text: string): boolean =>
   text.replace(/^\uFEFF/, "").trim() === "";
 
+// A YAML document with nothing but comments has no root; one with only a `---`
+// marker has a null scalar written as nothing. `null` and `~` are written out.
+const isEmptyYamlRoot = (root: YamlDocument["contents"]): boolean =>
+  root === null ||
+  (isScalar(root) &&
+    root.value === null &&
+    root.source === "" &&
+    root.tag === undefined &&
+    root.anchor === undefined);
+
+const parseHermesYamlDocument = (text: string): YamlDocument => {
+  const document = parseYamlDocument(text);
+  const error = document.errors[0];
+  if (error !== undefined) throw error;
+  return document;
+};
+
 const parseDocument = (
   text: string,
   format: ClientConfigurationFormat,
@@ -116,9 +134,16 @@ const parseDocument = (
   // An empty file, which some clients create before any server is added,
   // holds no settings to preserve.
   if (isEmptyClientConfigurationText(text)) return {};
-  // Hermes stores MCP servers in `mcp_servers` inside a YAML document.
-  if (format === "hermes")
-    return requireObject(parseYaml(text), "The configuration root");
+  // Hermes stores MCP servers in `mcp_servers` inside a YAML document. A
+  // document of only comments or a bare `---` marker holds no settings. An
+  // explicit `null` or `~` root is still rejected, as any other non-map is.
+  if (format === "hermes") {
+    const document = parseHermesYamlDocument(text);
+    return requireObject(
+      isEmptyYamlRoot(document.contents) ? {} : document.toJS(),
+      "The configuration root",
+    );
+  }
   // ZCode loads nonempty native files with strict JSON.parse.
   if (format === "zcode")
     return requireObject(JSON.parse(text), "The configuration root");
@@ -1419,7 +1444,17 @@ const serializeHermesConfiguration = (
     typeof servers === "object" && servers !== null
       ? (servers as Record<string, unknown>)[PRODUCT_IDENTITY.mcpServerKey]
       : undefined;
-  const yamlDocument = parseYamlDocument(originalText);
+  const yamlDocument = parseHermesYamlDocument(originalText);
+  // A bare `---` document holds a null scalar, which takes no keys. Replace it
+  // with a map that keeps the comments written after the marker.
+  const root = yamlDocument.contents;
+  if (isScalar(root) && isEmptyYamlRoot(root)) {
+    const map = yamlDocument.createNode({});
+    map.commentBefore = [root.commentBefore, root.comment]
+      .filter((comment) => comment !== undefined)
+      .join("\n");
+    yamlDocument.contents = map;
+  }
   if (entry === undefined)
     yamlDocument.deleteIn([serversKey, PRODUCT_IDENTITY.mcpServerKey]);
   else yamlDocument.setIn([serversKey, PRODUCT_IDENTITY.mcpServerKey], entry);
