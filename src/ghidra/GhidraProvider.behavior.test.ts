@@ -1892,14 +1892,27 @@ describe("Ghidra disabled analyzer options", () => {
       throw new Error("expected a bound Ghidra profile");
     expect(resolved.value.profile.parameters).toMatchObject({
       analyzer_preset:
-        "ghidra-default+disabled:Objective-C Message Analyzer,Decompiler Switch Analysis",
+        "ghidra-default+disabled:Decompiler Switch Analysis,Objective-C Message Analyzer",
       analysis_options: {
         disabled_analyzers: [
-          "Objective-C Message Analyzer",
           "Decompiler Switch Analysis",
+          "Objective-C Message Analyzer",
         ],
       },
     });
+  });
+
+  it("keeps profile commitments identical for equivalent analyzer settings", async () => {
+    const target = executableTarget("elf", "x86_64");
+    const first = await configuredProvider({
+      REA_GHIDRA_DISABLED_ANALYZERS: "B,A,B",
+    }).resolveAnalysisProfile(target);
+    const second = await configuredProvider({
+      REA_GHIDRA_DISABLED_ANALYZERS: "A,B",
+    }).resolveAnalysisProfile(target);
+    if (!first.ok || !second.ok || first.value.profile === null)
+      throw new Error("expected bound profiles");
+    expect(second.value.profile).toEqual(first.value.profile);
   });
 
   it("hands the configured analyzers to the launcher for a matching profile", async () => {
