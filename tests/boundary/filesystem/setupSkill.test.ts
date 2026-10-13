@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   access,
   chmod,
@@ -339,6 +342,7 @@ describe("canonical skill transaction", () => {
       "android-applications.md",
       "runtime-observation.md",
       "evidence-workflows.md",
+      "playstation-discs.md",
     ]) {
       const installed = await readFile(
         join(dirname(destination), "references", reference),
@@ -394,7 +398,9 @@ describe("canonical skill transaction", () => {
       "references/evidence-workflows.md",
       "references/javascript-applications.md",
       "references/native-and-artifacts.md",
+      "references/playstation-discs.md",
       "references/runtime-observation.md",
+      "scripts/ps1_inspect.py",
     ];
     const records = await Promise.all(
       paths.map(async (path) => {
@@ -423,6 +429,62 @@ describe("canonical skill transaction", () => {
       sha256: createHash("sha256").update(records.join("")).digest("hex"),
     });
   });
+});
+
+it("installs a runnable disc helper and detects missing helper bytes", async () => {
+  const execute = promisify(execFile);
+  const home = await createTestTempDirectory("rea-ps1-installed-skill-");
+  expect(await installCanonicalSkill(home)).toMatchObject({
+    ok: true,
+    value: "installed",
+  });
+  const helper = join(
+    home,
+    ".agents/skills/reverse-engineer-anything/scripts/ps1_inspect.py",
+  );
+  const disc = join(home, "synthetic.iso");
+  const boot = join(home, "synthetic.psx");
+  // Source-owned fixture generation is separate from the installed consumer.
+  await execute(
+    "python3",
+    [
+      "-B",
+      "-c",
+      'from pathlib import Path; import runpy, sys; Path(sys.argv[2]).write_bytes(runpy.run_path(sys.argv[1])["iso_fixture"]())',
+      fileURLToPath(
+        new URL("../../fixtures/ps1/test_inspector.py", import.meta.url),
+      ),
+      disc,
+    ],
+    { timeout: 10_000 },
+  );
+  const result = await execute(
+    "python3",
+    ["-B", helper, disc, "--boot-out", boot],
+    {
+      cwd: home,
+      timeout: 10_000,
+    },
+  );
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    schema: "ps1-disc-summary-v1",
+    boot_path: "DEMO_000.01;1",
+    boot_executable: {
+      initial_pc: "0x80010040",
+      load_address: "0x80010000",
+      file_sha256: createHash("sha256")
+        .update(await readFile(boot))
+        .digest("hex"),
+    },
+  });
+  expect(await canonicalSkillNeedsInstall(home)).toBe(false);
+  await rm(helper);
+  expect(await canonicalSkillNeedsInstall(home)).toBe(true);
+  expect(await installCanonicalSkill(home)).toMatchObject({
+    ok: true,
+    value: "installed",
+  });
+  expect(await canonicalSkillNeedsInstall(home)).toBe(false);
 });
 
 it("doctor verifies installed instructions and references even when metadata is current", async () => {
