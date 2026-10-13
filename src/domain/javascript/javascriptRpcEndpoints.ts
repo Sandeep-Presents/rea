@@ -1,6 +1,7 @@
 import * as t from "@babel/types";
 
 import {
+  readExactJavaScriptLiteral,
   unwrapJavaScriptExpression,
   semanticStaticPropertyKey,
 } from "./javascriptAstValues.js";
@@ -163,11 +164,8 @@ const GRAPHQL_OPERATION_HEADER =
 const isGraphqlIgnoredCharacter = (character: string): boolean =>
   character === "," || character === "﻿" || /\s/u.test(character);
 
-/** Recover a named operation from GraphQL document text. */
-export const graphqlOperationFromText = (
-  text: string,
-): JavaScriptRpcEndpoint | undefined => {
-  // Skip GraphQL ignored tokens: whitespace, commas, BOM and # comments.
+/** Skip GraphQL ignored tokens: whitespace, commas, BOM and # comments. */
+const skipGraphqlIgnored = (text: string): number => {
   const limit = text.length;
   let index = 0;
   while (index < limit) {
@@ -177,7 +175,15 @@ export const graphqlOperationFromText = (
       while (index < limit && !/[\n\r]/u.test(text.charAt(index))) index += 1;
     } else break;
   }
-  if (index >= limit) return undefined;
+  return index;
+};
+
+/** Recover a named operation from GraphQL document text. */
+export const graphqlOperationFromText = (
+  text: string,
+): JavaScriptRpcEndpoint | undefined => {
+  const index = skipGraphqlIgnored(text);
+  if (index >= text.length) return undefined;
   const header = GRAPHQL_OPERATION_HEADER.exec(text.slice(index));
   const type = header?.[1];
   const name = header?.[2];
@@ -310,11 +316,24 @@ export const createJavaScriptRpcScan = (
           ? undefined
           : graphqlOperationFromText(node.value);
       if (t.isTemplateLiteral(node)) {
-        // A template recovered without a cooked value stays dynamic.
-        const cooked = node.quasis[0]?.value.cooked;
-        return cooked === undefined || cooked === null
-          ? undefined
-          : graphqlOperationFromText(cooked);
+        // Only exact syntax-level values can establish the combined document's
+        // lexical context. A dynamic interpolation may contain a comment,
+        // block string or non-fragment definition, so later text stays unknown.
+        const pieces: string[] = [];
+        for (const [index, quasi] of node.quasis.entries()) {
+          const cooked = quasi.value.cooked;
+          if (cooked === undefined || cooked === null) return undefined;
+          pieces.push(cooked);
+          const expression = node.expressions[index];
+          if (expression === undefined) continue;
+          const literal = readExactJavaScriptLiteral(expression);
+          if (!literal.found)
+            // An already observed leading header survives an unknown suffix;
+            // never resume scanning after this unresolved boundary.
+            return graphqlOperationFromText(pieces.join(""));
+          pieces.push(String(literal.value));
+        }
+        return graphqlOperationFromText(pieces.join(""));
       }
       return undefined;
     },
