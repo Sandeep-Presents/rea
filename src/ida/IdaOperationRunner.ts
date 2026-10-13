@@ -97,6 +97,11 @@ export class IdaOperationRunner {
       readonly x86Only?: boolean;
       /** False when the upstream server does not advertise `callgraph`. */
       readonly callGraphAvailable?: boolean;
+      /**
+       * Public admitted path of the single document this runner is bound to.
+       * The headless private copy is an internal resource, not a caller identity.
+       */
+      readonly documentIdentity?: string | undefined;
     } = {},
   ) {}
 
@@ -540,6 +545,15 @@ export class IdaOperationRunner {
       const inspectedAddress = idaAddressSchema.parse(parameters.address);
       this.locations.push({ kind: "address", address: inspectedAddress });
       return (await this.xrefs(inspectedAddress)).map(({ address }) => address);
+    }
+    if (operation === "list_documents") {
+      // Return the admitted public identity that later document selectors accept.
+      const identity = this.options.documentIdentity;
+      if (identity === undefined || identity.length === 0)
+        throw new AnalysisProtocolError(
+          "IDA session has no bound document identity.",
+        );
+      return [identity];
     }
     const fn = await this.resolve(
       z.string().min(1).parse(parameters.procedure),

@@ -293,6 +293,7 @@ export class IdaSessionClient implements AnalysisClient {
         selectorOrigin: options?.selectorOrigin,
         x86Only: isX86OnlyTarget(this.target),
         callGraphAvailable: this.#callGraphAdvertised,
+        documentIdentity: this.target.path,
       },
     );
   }
