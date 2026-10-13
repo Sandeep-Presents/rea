@@ -24,6 +24,8 @@ import type {
   JavaScriptArtifactFileKind,
   JavaScriptArtifactFile,
   JavaScriptArtifactContainer,
+  JavaScriptUnanalyzedArtifactFile,
+  JavaScriptUnanalyzedArtifactLookup,
   JavaScriptArtifactFileSet,
 } from "../../domain/javascript/javascriptArtifactFiles.js";
 
@@ -139,6 +141,10 @@ export const readJavaScriptArtifactFiles = async (
   assertExpectedFilesWereVisited(expected, files);
   return {
     files,
+    unanalyzed_files: createUnanalyzedArtifactLookup(
+      snapshot,
+      context.containers,
+    ),
     containers: context.containers.sort((left, right) =>
       compareUnicodeCodePoints(left.path, right.path),
     ),
@@ -430,6 +436,77 @@ const expectedInventory = (
     });
   }
   return { files, containers, unavailableFiles };
+};
+
+const createUnanalyzedArtifactLookup = (
+  snapshot: ArtifactInventorySnapshot,
+  containers: readonly JavaScriptArtifactContainer[],
+): JavaScriptUnanalyzedArtifactLookup => {
+  const requested = new Map<
+    string,
+    JavaScriptUnanalyzedArtifactFile | undefined
+  >();
+  const directories = new Map<string, Map<string | undefined, boolean>>();
+  const containerFor = (path: string): string => {
+    let selected: JavaScriptArtifactContainer | undefined;
+    for (const container of containers)
+      if (
+        path.startsWith(`${container.path}/`) &&
+        (selected === undefined || container.path.length > selected.path.length)
+      )
+        selected = container;
+    return selected?.sha256 ?? snapshot.manifest.root_sha256;
+  };
+  const isOpaque = (occurrence: ArtifactOccurrence): boolean =>
+    occurrence.entry_kind === "file" &&
+    occurrence.artifact_id !== null &&
+    relevantKind(occurrence.logical_path) === undefined &&
+    !occurrence.logical_path.toLowerCase().endsWith(".asar");
+  return {
+    get(path) {
+      if (requested.has(path)) return requested.get(path);
+      const occurrence = snapshot.occurrences.find(
+        (entry) => entry.logical_path === path && isOpaque(entry),
+      );
+      const node =
+        occurrence === undefined
+          ? undefined
+          : snapshot.nodes.find(
+              (entry) => entry.artifact_id === occurrence.artifact_id,
+            );
+      const file =
+        node === undefined
+          ? undefined
+          : {
+              path,
+              container_sha256: containerFor(path),
+              sha256: node.sha256,
+              bytes: node.size,
+              inventory_artifact_id: node.artifact_id,
+            };
+      requested.set(path, file);
+      return file;
+    },
+    hasDirectory(path, containerSha256) {
+      let results = directories.get(path);
+      const previous = results?.get(containerSha256);
+      if (previous !== undefined) return previous;
+      const prefix = `${path}/`;
+      const present = snapshot.occurrences.some(
+        (entry) =>
+          entry.logical_path.startsWith(prefix) &&
+          isOpaque(entry) &&
+          (containerSha256 === undefined ||
+            containerFor(entry.logical_path) === containerSha256),
+      );
+      if (results === undefined) {
+        results = new Map();
+        directories.set(path, results);
+      }
+      results.set(containerSha256, present);
+      return present;
+    },
+  };
 };
 
 const readAll = async (
