@@ -33,6 +33,8 @@ export const SCOPES = {
   package: [
     "src/windows/**",
     "native/windows/**",
+    "src/process/capture/FilesystemSnapshot.ts",
+    "src/process/capture/FilesystemSnapshot.test.ts",
     "src/inspector/**",
     "scripts/verify/inspector/**",
     "scripts/verify-package.mjs",
