@@ -23,7 +23,7 @@ export const waitForAbortableDelay = (
 };
 
 /**
- * One absolute deadline shared by every phase of a provider startup handshake.
+ * One monotonic deadline shared by every phase of a provider startup handshake.
  *
  * The deadline owns its timer and the listener attached to an optional caller
  * signal. Adapters must dispose it after startup succeeds or fails.
