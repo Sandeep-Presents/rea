@@ -103,6 +103,15 @@ build's source revision, so that field remains unknown.
   engine finished its configured extraction without those reported conditions;
   default skip rules and format coverage still apply. It does not establish
   complete firmware reconstruction.
+- `extraction_gaps` makes those conditions recoverable: a row identifies an
+  unextracted region or a failed task/stage. A chunk retains its identity and
+  byte range, plus its original-file range when it belongs to the selected input.
+  A multi-file stage retains its reported ID and handler with unknown byte ranges;
+  a standalone task failure keeps unavailable stage identity null. Rows retain exact dependency names from
+  the producer's missing-dependency reports, and a supported continuation that
+  uses already configured capabilities where one exists. A listed gap does not
+  mean the target is corrupt or that a retained region is empty; REA installs
+  nothing.
 - The destination must be absent, absolute, with an existing parent. Publication
   uses exclusive, symlink-resistant writes and durable digest readback. Existing
   destinations are never overwritten. This is not an atomic directory rename:
@@ -166,6 +175,11 @@ override with `REA_FIRMWARE_PYTHON` / `REA_FIRMWARE_CC`. The independent oracle
 records gzip offset/length and extracted file hashes. Real verification checks
 CLI/MCP, full-file and selected-range extraction, unknown chunks, depth limits,
 content parity and unchanged source bytes. No binary fixture is committed.
+
+The optional missing-extractor lane asserts dependency names and the owning
+handler in `extraction_gaps`. Those assertions must be run against the pinned
+Unblob release to establish real-provider coverage; synthetic producer fixtures
+alone do not verify Unblob's report nesting or stage identities.
 
 Additional lanes are explicit, so the base lane stays small:
 
