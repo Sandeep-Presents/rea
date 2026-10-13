@@ -555,6 +555,7 @@ const createState = (
     parentsByNode: new WeakMap(),
     scopes: [root],
     scopesById: new Map([[root.scopeId, root]]),
+    namespaceExportScopes: new Map(),
     scopeByNode: new WeakMap([[program, root]]),
     bindingsById: new Map(),
     callables: [],
@@ -623,7 +624,7 @@ function* collectDefinitionsSteps(
         openedScopes.set(node, 1);
         parentScope = dynamicScope;
       }
-      bindOuterDeclaration(node, parentScope, state);
+      bindOuterDeclaration(node, namespaceDeclarationScope(node, parentScope, state), state);
       const nested = nestedScope(node, parent, parentScope, state);
       if (nested !== undefined) {
         stack.push(nested);
@@ -780,12 +781,12 @@ const bindInnerDeclaration = (
 ): void => {
   if (t.isImportDeclaration(node)) bindImports(node, scope, state);
   else if (t.isTSImportEqualsDeclaration(node))
-    bindImportEquals(node, scope, state);
+    bindImportEquals(node, namespaceDeclarationScope(node, scope, state), state);
   else if (t.isVariableDeclarator(node))
     bindPattern({
       pattern: node.id,
       initializer: node.init ?? null,
-      scope: semanticVariableScope(scope, parent, state),
+      scope: semanticVariableScope(namespaceDeclarationScope(node, scope, state), parent, state),
       state,
       mutable:
         parent !== null && t.isVariableDeclaration(parent)
@@ -819,8 +820,8 @@ const bindImportEquals = (
   scope: JavaScriptSemanticScopeState,
   state: JavaScriptSemanticAnalysisState,
 ): void => {
+  if (node.importKind === "type") return;
   const specifier = semanticImportEqualsSpecifier(node);
-  if (specifier === null) return;
   addBinding({
     state,
     scope,
@@ -828,8 +829,16 @@ const bindImportEquals = (
     kind: "import",
     mutable: false,
     definitionNode: node.id,
-    initializer: null,
-    directOrigin: { specifier, importedPath: [], resolutionMode: "require" },
+    initializer: specifier === null ? node.moduleReference : null,
+    ...(specifier === null
+      ? {}
+      : {
+          directOrigin: {
+            specifier,
+            importedPath: [],
+            resolutionMode: "require" as const,
+          },
+        }),
   });
 };
 
@@ -877,6 +886,25 @@ const bindAssignment = (
     }
 };
 
+// Exported namespace declarations belong to the shared exported-member owner;
+// every namespace block keeps a distinct private lexical environment.
+const namespaceDeclarationScope = (
+  node: t.Node,
+  scope: JavaScriptSemanticScopeState,
+  state: JavaScriptSemanticAnalysisState,
+): JavaScriptSemanticScopeState => {
+  if (scope.namespaceExportScopeId === undefined) return scope;
+  let declaration = node;
+  let parent = state.parentsByNode.get(declaration);
+  if (t.isVariableDeclarator(declaration) && t.isVariableDeclaration(parent)) {
+    declaration = parent;
+    parent = state.parentsByNode.get(declaration);
+  }
+  if (t.isExportNamedDeclaration(parent) && parent.declaration === declaration)
+    return state.scopesById.get(scope.namespaceExportScopeId) ?? scope;
+  return scope;
+};
+
 const nestedScope = (
   node: t.Node,
   parent: t.Node | null,
@@ -895,6 +923,27 @@ const nestedScope = (
   }
   const kind = scopeKind(node, parent);
   if (kind === undefined) return undefined;
+  let namespaceExportScopeId: string | undefined;
+  if (t.isTSModuleBlock(node) && t.isTSModuleDeclaration(parent)) {
+    const name = t.isIdentifier(parent.id) ? parent.id.name : parent.id.value;
+    const parentOwner = namespaceDeclarationScope(parent, parentScope, state);
+    const key = JSON.stringify([parentOwner.scopeId, name]);
+    let exported = state.namespaceExportScopes.get(key);
+    if (exported === undefined) {
+      exported = {
+        scopeId: `${semanticScopeId("namespace", parent)}:exports`,
+        parentScopeId: parentOwner.scopeId,
+        kind: "namespace",
+        location: range(parent),
+        bindingsComplete: true,
+        bindings: new Map(),
+      };
+      state.namespaceExportScopes.set(key, exported);
+      state.scopes.push(exported);
+      state.scopesById.set(exported.scopeId, exported);
+    }
+    namespaceExportScopeId = exported.scopeId;
+  }
   const scope: JavaScriptSemanticScopeState = {
     scopeId: semanticScopeId(kind, switchOwner ?? node),
     parentScopeId:
@@ -902,6 +951,7 @@ const nestedScope = (
       parentScope.scopeId,
     kind,
     location: range(switchOwner ?? node),
+    ...(namespaceExportScopeId === undefined ? {} : { namespaceExportScopeId }),
     bindingsComplete: true,
     bindings: new Map(),
   };
@@ -946,6 +996,7 @@ const scopeKind = (
   parent: t.Node | null,
 ): JavaScriptSemanticScopeState["kind"] | undefined => {
   if (t.isFunction(node)) return "function";
+  if (t.isTSModuleBlock(node)) return "namespace";
   if (t.isClass(node)) return "class";
   if (t.isCatchClause(node)) return "catch";
   if (
