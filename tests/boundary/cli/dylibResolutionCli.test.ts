@@ -510,6 +510,8 @@ cliTest(
           app,
           "--root",
           "Contents/MacOS/App",
+          "--architecture",
+          "arm64e",
           "--json",
         ],
         environment: ENVIRONMENT,
