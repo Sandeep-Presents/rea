@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, chmod, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
@@ -369,10 +370,53 @@ it.each([
       };
     },
   );
+  const literal = 'fetch("./selected.wasm");';
+  const glueSources =
+    mode === "success"
+      ? [
+          literal,
+          `\uFEFF${literal}`,
+          `\uFEFF\n${literal}`,
+          `#!/usr/bin/env node\n${literal}`,
+          `\uFEFF#!/usr/bin/env node\n${literal}`,
+        ]
+      : [];
+  const gluePaths = glueSources.map((_, index) =>
+    join(selectedRoot, `glue-${index}.js`),
+  );
+  await Promise.all(
+    gluePaths.map((gluePath, index) =>
+      writeFile(gluePath, glueSources[index]!),
+    ),
+  );
   const result = await provider.inspect(
-    { path, glue_paths: [], candidate_paths: [] },
+    { path, glue_paths: gluePaths, candidate_paths: [] },
     { signal: controller.signal },
   );
+  if (mode === "success" && result.ok) {
+    const glue = result.value.result.glue;
+    expect(glue).toHaveLength(glueSources.length);
+    for (const [index, source] of glueSources.entries()) {
+      expect(glue[index]).toMatchObject({
+        artifact: {
+          path: gluePaths[index],
+          sha256: createHash("sha256").update(source).digest("hex"),
+          bytes: Buffer.byteLength(source),
+        },
+        parse_status: "complete",
+        references: [
+          {
+            value: "./selected.wasm",
+            line: source.includes("\n") ? 2 : 1,
+            column: source.startsWith("\uFEFFfetch") ? 7 : 6,
+            candidate_paths: [path],
+            association: "local-path-candidate",
+            evidence_kind: "static-literal",
+          },
+        ],
+      });
+    }
+  }
   assertModeOutcome(mode, result, path);
   if (mode === "cleanup") {
     await assertCleanupRecovery({
