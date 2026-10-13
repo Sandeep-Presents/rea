@@ -20,6 +20,7 @@ import {
   type TransportSendOptions,
 } from "@modelcontextprotocol/server";
 
+import type { McpToolSelection } from "../config/mcpToolSelection.js";
 import { analysisErrorProjectionSchema } from "../contracts/errorSchemas.js";
 import { compactAdvertisedInputSchema } from "../contracts/compactInputSchema.js";
 import { transformAdvertisedInputJsonSchema } from "../contracts/toolSchemaMetadata.js";
@@ -72,6 +73,7 @@ export class EvidenceMcpServer extends McpServer {
     private readonly compactPresentation:
       | CompactInputSchemaPresentation
       | undefined = undefined,
+    private readonly toolSelection: McpToolSelection | undefined = undefined,
   ) {
     super(info, options);
   }
@@ -114,13 +116,23 @@ export class EvidenceMcpServer extends McpServer {
               compactAdvertisedInputSchema(projected, budget).schema,
           )
         : undefined;
-    return super.registerTool(
+    const registered = super.registerTool(
       name,
       (inputSchema === undefined
         ? config
         : { ...config, inputSchema }) as never,
       callback as never,
     );
+    // An operator-deselected tool is removed before any client connects, so
+    // it is neither advertised by tools/list nor callable through tools/call.
+    if (this.toolSelection !== undefined && !this.toolSelection(name))
+      registered.remove();
+    return registered;
+  }
+
+  /** Report whether the operator tool selection registers this public tool. */
+  selectsTool(name: string): boolean {
+    return this.toolSelection === undefined || this.toolSelection(name);
   }
 
   /** Preserve the SDK transport lifecycle while retaining oversized errors. */

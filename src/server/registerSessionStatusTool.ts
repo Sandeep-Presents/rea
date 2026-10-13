@@ -72,6 +72,7 @@ export const registerSessionStatusTool = (
           androidAnalysisAvailability: androidAvailability,
         },
         clientFeatures,
+        (name) => server.selectsTool(name),
       );
       const serverIdentity = createServerIdentity({
         startedAt,

@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import { CATALOG_IDENTITY } from "./catalogIdentity.js";
 import { PROMPT_CONTRACTS } from "./contracts/promptContracts.js";
 import { TOOL_CONTRACTS } from "./contracts/toolContracts.js";
+import { parseMcpToolSelection } from "./config/mcpToolSelection.js";
 import { err, ok } from "./domain/result.js";
 import { PRODUCT_IDENTITY } from "./identity.js";
 import { MCP_STARTUP_POLICY } from "./mcpStartupPolicy.js";
@@ -67,6 +68,7 @@ interface InventoryComparison {
 }
 
 interface McpDoctorCheck {
+  readonly skipped?: boolean;
   readonly name: string;
   readonly ok: boolean;
   readonly detail: string;
@@ -103,6 +105,7 @@ export const runProductionMcpDoctor = async (options: McpDoctorOptions) => {
       client,
       deadline,
       controller.signal,
+      expectedToolNames(options.environment),
     );
   } catch (cause: unknown) {
     result = {
@@ -159,6 +162,20 @@ export const runProductionMcpDoctor = async (options: McpDoctorOptions) => {
   return { ...result, diagnostics: stderr.value() };
 };
 
+/**
+ * The tools the child should register under the inherited operator tool
+ * selection. An invalid selection keeps the complete inventory as the
+ * expectation; the child rejects that configuration itself.
+ */
+const expectedToolNames = (
+  environment: Readonly<Record<string, string | undefined>>,
+): readonly string[] => {
+  const selection = parseMcpToolSelection(environment);
+  return TOOL_CONTRACTS.map(({ name }) => name).filter(
+    (name) => !selection.ok || selection.value(name),
+  );
+};
+
 type ProductionMcpDoctorResult =
   | Awaited<ReturnType<typeof inspectProductionMcpSession>>
   | {
@@ -188,6 +205,7 @@ const inspectProductionMcpSession = async (
   client: Client,
   deadline: number,
   signal: AbortSignal,
+  expectedTools: readonly string[],
 ) => {
   const request = requestOptions(deadline, signal);
   const [tools, prompts] = await Promise.all([
@@ -195,20 +213,25 @@ const inspectProductionMcpSession = async (
     client.listPrompts(undefined, request),
   ]);
   const sessionTool = tools.tools.find(({ name }) => name === "binary_session");
-  const requestFlow = await client
-    .callTool(
-      { name: "binary_session", arguments: {} },
-      {
-        ...requestOptions(deadline, signal),
-        ...(sessionTool === undefined ? {} : { toolDefinition: sessionTool }),
-      },
-    )
-    .then(ok, (cause: unknown) =>
-      err({ kind: "request-flow" as const, detail: errorMessage(cause) }),
-    );
+  const sessionSelected = expectedTools.includes("binary_session");
+  const requestFlow = sessionSelected
+    ? await client
+        .callTool(
+          { name: "binary_session", arguments: {} },
+          {
+            ...requestOptions(deadline, signal),
+            ...(sessionTool === undefined
+              ? {}
+              : { toolDefinition: sessionTool }),
+          },
+        )
+        .then(ok, (cause: unknown) =>
+          err({ kind: "request-flow" as const, detail: errorMessage(cause) }),
+        )
+    : undefined;
   const inventory = {
     tools: compareInventory(
-      TOOL_CONTRACTS.map(({ name }) => name),
+      expectedTools,
       tools.tools.map(({ name }) => name),
     ),
     prompts: compareInventory(
@@ -217,7 +240,7 @@ const inspectProductionMcpSession = async (
     ),
   };
   const observedIdentity = parseIdentityToolResult(
-    requestFlow.ok ? requestFlow.value.structuredContent : undefined,
+    requestFlow?.ok ? requestFlow.value.structuredContent : undefined,
   );
   const serverVersion = client.getServerVersion();
   const protocolVersion = client.getNegotiatedProtocolVersion();
@@ -236,17 +259,27 @@ const inspectProductionMcpSession = async (
     {
       name: "server-identity",
       ok:
-        observedIdentity.packageVersion === PRODUCT_IDENTITY.packageVersion &&
-        observedIdentity.catalogDigest ===
-          CATALOG_IDENTITY.digests.combined_sha256,
-      detail: `package=${observedIdentity.packageVersion ?? "missing"}; catalog=${observedIdentity.catalogDigest ?? "missing"}`,
+        !sessionSelected ||
+        (observedIdentity.packageVersion === PRODUCT_IDENTITY.packageVersion &&
+          observedIdentity.catalogDigest ===
+            CATALOG_IDENTITY.digests.combined_sha256),
+      ...(sessionSelected ? {} : { skipped: true }),
+      detail: sessionSelected
+        ? `package=${observedIdentity.packageVersion ?? "missing"}; catalog=${observedIdentity.catalogDigest ?? "missing"}`
+        : "Skipped: binary_session excluded by operator selection",
     },
     {
       name: "request-flow",
-      ok: requestFlow.ok && requestFlow.value.isError !== true,
-      detail: requestFlow.ok
-        ? "binary_session target-free request"
-        : requestFlow.error.detail,
+      ok:
+        requestFlow === undefined ||
+        (requestFlow.ok && requestFlow.value.isError !== true),
+      ...(sessionSelected ? {} : { skipped: true }),
+      detail:
+        requestFlow === undefined
+          ? "Skipped: binary_session excluded by operator selection"
+          : requestFlow.ok
+            ? "binary_session target-free request"
+            : requestFlow.error.detail,
     },
   ];
   return {
@@ -266,7 +299,11 @@ const inspectProductionMcpSession = async (
     },
     request_flow: {
       tool: "binary_session",
-      ok: requestFlow.ok && requestFlow.value.isError !== true,
+      ok:
+        requestFlow === undefined
+          ? null
+          : requestFlow.ok && requestFlow.value.isError !== true,
+      ...(sessionSelected ? {} : { skipped: true }),
     },
     checks,
   };
